@@ -1,9 +1,23 @@
-# Lake ELK ESP-NOW issue — combined package for Grok
+# Lake ELK ESP-NOW issue — combined package (UPDATED 2026-05-10 with EXACT v62 source)
 
-This single file contains everything: the problem writeup AND both relevant source files inline. Just share this file with Grok.
+## Update from ChatGPT's first pass
+
+ChatGPT noticed the contradiction better than I did and reframed the diagnosis:
+
+> ELK was NOT frozen. RSSI updated, RX counter updated, clock updated, footer updated, display refreshed normally. But operational table data remained zeros and "Waiting for HVACv62..." stayed visible. Therefore: ESP-NOW transport was alive, callback was alive, watchdog loop was alive. **The failure is likely DOWNSTREAM of packet receipt** — payload decode, struct interpretation, validity gating, frame assembly, or shared-data corruption.
+>
+> Most likely causes now:
+> 1. Silent struct mismatch despite same packet size
+> 2. Field-order drift between HVACv62 and ELKv46
+> 3. Race condition during memcpy/read
+> 4. Validity flag never set after packet receipt
+>
+> Need to inspect: exact Frame A/B structs on both sides, packed attributes, bool/int alignment, memcpy timing, volatile/shared access, dataReady handling, any "valid frame" gating before rendering.
+
+ChatGPT requested the EXACT v62 source (not an approximation). It's now included below.
 
 ================================================================================
-PART 1 — PROBLEM WRITEUP (from README)
+PART 1 — PROBLEM WRITEUP
 ================================================================================
 
 # Lake ELK ESP-NOW silent receive + missing self-restart — for Grok analysis
@@ -94,8 +108,7 @@ Until very recently, no logger was running on the ELK side (`/dev/ttyUSB0` on la
 The two .ino files are the actual source. Drop them in along with this README and ask Grok to analyze.
 
 ================================================================================
-PART 2 — LAKE ELK FIRMWARE SOURCE (lake_ELK_v46.ino)
-Currently flashed on the lake ELK board. ELKv46.
+PART 2 — LAKE ELK FIRMWARE SOURCE (lake_ELK_v46.ino) — EXACT, currently flashed
 ================================================================================
 
 ```cpp
@@ -817,15 +830,15 @@ void loop() {
 ```
 
 ================================================================================
-PART 3 — HVAC FIRMWARE SOURCE (closest to lake's v62)
-Lake HVAC runs HVACv62. Exact v62 source not preserved as backup.
-This is HVACv64 — the closest predecessor on disk, no struct changes between v62-v64.
+PART 3 — LAKE HVAC FIRMWARE SOURCE (lake_HVAC_v62_EXACT.ino) — EXACT v62
+Pulled directly from lake-pi5 at /home/lake/HVAC/HVAC/HVAC.ino — file mtime 2026-05-05 19:18.
+This is the actual source compiled and flashed onto the lake HVAC board.
 ================================================================================
 
 ```cpp
 // *** CHANGE SKETCH NAME HERE ONLY — propagates everywhere automatically ***
-#define SKETCH_NAME "HVACv64"
-#define PAIRED_WITH "ELKv35"
+#define SKETCH_NAME "HVACv62"
+#define PAIRED_WITH "ELKv43"
 
 // **************************************************************************
 
@@ -974,7 +987,7 @@ Adafruit_ADS1115 ads;
 #define STATE_HI_HEAT 3
 
 // ================================================================
-// STRUCT - 232 bytes - must match ELKv32 exactly
+// 320 bytes - must match ELKv43 exactly
 // ================================================================
 struct hvac_data {
   float         outdoorTemp;
@@ -1018,8 +1031,70 @@ struct hvac_data {
   int           pumpCycleCount;  // NEW v36
   int           wtrCycleCount;   // NEW v36
   float         kwhRate;         // NEW v51 - pushed to ELK so ELK can compute $
+  // v62 (Lake): Today/Yest entities fetched from HA for ELK display
+  float         lakeGeoKwhToday;
+  float         lakeGeoKwhYest;
+  int           lakeGeoMinutesToday;
+  int           lakeGeoMinutesYest;
+  int           lakeGeoCyclesToday;
+  int           lakeGeoCyclesYest;
+  float         lakePumpKwhToday;
+  float         lakePumpKwhYest;
+  int           lakePumpMinutesToday;
+  int           lakePumpMinutesYest;
+  int           lakePumpCyclesToday;
+  int           lakePumpCyclesYest;
+  float         lakeWaterKwhToday;
+  float         lakeWaterKwhYest;
+  int           lakeWaterMinutesToday;
+  int           lakeWaterMinutesYest;
+  int           lakeWaterCyclesToday;
+  int           lakeWaterCyclesYest;
+  float         lakeMainsKwhToday;
+  float         lakeMainsKwhYest;
+  float         lakeMainsDollarsToday;
+  float         lakeMainsDollarsYest;
 } myData;
-// struct size: 232 bytes - must match ELKv32 exactly
+
+// =================================================================
+// FRAME B -- Lake-only extension (HVACv55 / ELKv36)
+// Filled from Serial "EXT 1 ..." lines published by lake-monitor.service.
+// Sent via ESP-NOW after myData when isLakeHouse is true.
+// =================================================================
+struct ext_device {
+  uint16_t today_cents;
+  uint16_t yesterday_cents;
+  uint16_t runtime_min;
+  uint8_t  cycles;
+  uint8_t  flag;
+};
+struct hvac_lake_extension {
+  uint16_t magic;
+  uint8_t  version;
+  uint8_t  reserved;
+  uint16_t geo_today_cents,        geo_yesterday_cents;
+  uint16_t pump_geo_today_cents,   pump_geo_yesterday_cents;
+  uint16_t pump_wtr_today_cents,   pump_wtr_yesterday_cents;
+  // v57: Emporia-derived runtime + cycles for geo and pump (priority rows on OLED+ELK)
+  uint16_t geo_runtime_min;
+  uint8_t  geo_cycles;
+  uint8_t  reserved_a;
+  uint16_t pump_runtime_min;
+  uint8_t  pump_cycles;
+  uint8_t  reserved_b;
+  ext_device devices[6];
+  uint16_t mains_today_cents;
+  uint16_t mains_yesterday_cents;
+  float    mains_kwh_today;
+  uint16_t misc_today_cents;
+  uint16_t misc_yesterday_cents;
+  float    source_water_f;
+  float    cop_today;
+  char     first_error[24];
+} myExt;
+static bool myExtFilled = false;
+static unsigned long lastExtUpdateMs = 0;
+// 320 bytes - must match ELKv43 exactly
 
 RTC_DATA_ATTR int bootCount = 0;
 RTC_DATA_ATTR int wdtResetCount = 0;
@@ -1078,6 +1153,16 @@ bool sdCardOK = false;
 bool ads1115OK = true;
 bool espnowOK = true;
 bool isLakeHouse = false;
+int activeChannel = 6;
+// v62 Lake: fetched HA values
+float fLkGeoKwhToday=0, fLkGeoKwhYest=0;
+int   fLkGeoMinT=0, fLkGeoMinY=0, fLkGeoCycT=0, fLkGeoCycY=0;
+float fLkPumpKwhToday=0, fLkPumpKwhYest=0;
+int   fLkPumpMinT=0, fLkPumpMinY=0, fLkPumpCycT=0, fLkPumpCycY=0;
+float fLkWaterKwhToday=0, fLkWaterKwhYest=0;
+int   fLkWaterMinT=0, fLkWaterMinY=0, fLkWaterCycT=0, fLkWaterCycY=0;
+float fLkMainsKwhToday=0, fLkMainsKwhYest=0;
+float fLkMainsDolToday=0, fLkMainsDolYest=0;             // v61: actual AP channel (Lake marknet=Ch6); WiFi.channel() updates after connect
 int espnowFailCount = 0;
 int espnowFailTotal = 0;
 int ctBadReadCount = 0;
@@ -1143,6 +1228,7 @@ const char* stateLabel(int state);
 void showWifiFailOLED();
 void postToHA();
 bool fetchCurrentRate();
+bool fetchLakeYesterdayMainsData();  // v62 Lake forward decl
 
 void onDataSent(const wifi_tx_info_t* tx_info, esp_now_send_status_t status) {
   lastSendOK = (status == ESP_NOW_SEND_SUCCESS);
@@ -1256,15 +1342,25 @@ bool connectWiFi() {
     Serial.println("[WiFi] FAILED"); wifiFailCount++; return false;
   }
   delay(200); wifiSuccessCount++;
+  // v61: detect AP's actual channel and lock ESP-NOW to match
+  activeChannel = WiFi.channel();
+  esp_wifi_set_channel(activeChannel, WIFI_SECOND_CHAN_NONE);
   Serial.print("[WiFi] OK RSSI:"); Serial.print(WiFi.RSSI());
-  Serial.print(" IP:"); Serial.println(WiFi.localIP());
+  Serial.print(" IP:"); Serial.print(WiFi.localIP());
+  Serial.printf(" Ch:%d\n", activeChannel);
+  // v61: re-add ESP-NOW peer with detected channel
+  esp_now_peer_info_t peer = {};
+  peer.channel = activeChannel; peer.encrypt = false; peer.ifidx = WIFI_IF_STA;
+  memcpy(peer.peer_addr, elkMAC, 6);
+  esp_now_del_peer(elkMAC);
+  esp_now_add_peer(&peer);
   return true;
 }
 
 void disconnectWiFi() {
   WiFi.disconnect(false); yieldDelay(200);
   WiFi.mode(WIFI_STA); yield();
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(activeChannel, WIFI_SECOND_CHAN_NONE);
   Serial.println("[WiFi] Ch1 restored, disconnected");
 }
 
@@ -1421,6 +1517,68 @@ bool fetchWeatherWork() {
   outdoorTemp = newTemp; lastWeatherFetch = time(NULL); yield(); return true;
 }
 
+// v62 Lake: Fetch yesterday + mains entities from HA. Lake only (Pondo skipped via isLakeHouse).
+bool fetchLakeYesterdayMainsData() {
+  if (!isLakeHouse) return true;
+  WiFiClientSecure client; client.setInsecure();
+  struct EF { const char* eid; void* dest; bool isInt; };
+  EF ents[22] = {
+    { "sensor.lake_emporia_geo_today_kwh",            &fLkGeoKwhToday,    false },
+    { "sensor.lake_emporia_geo_yesterday_kwh",        &fLkGeoKwhYest,     false },
+    { "sensor.lake_emporia_geo_today_runtime_min",    &fLkGeoMinT,        true  },
+    { "sensor.lake_emporia_geo_yesterday_runtime_min",&fLkGeoMinY,        true  },
+    { "sensor.lake_emporia_geo_today_cycles",         &fLkGeoCycT,        true  },
+    { "sensor.lake_emporia_geo_yesterday_cycles",     &fLkGeoCycY,        true  },
+    { "sensor.lake_emporia_well_pump_today_kwh",            &fLkPumpKwhToday, false },
+    { "sensor.lake_emporia_well_pump_yesterday_kwh",        &fLkPumpKwhYest,  false },
+    { "sensor.lake_emporia_well_pump_today_runtime_min",    &fLkPumpMinT,     true  },
+    { "sensor.lake_emporia_well_pump_yesterday_runtime_min",&fLkPumpMinY,     true  },
+    { "sensor.lake_emporia_well_pump_today_cycles",         &fLkPumpCycT,     true  },
+    { "sensor.lake_emporia_well_pump_yesterday_cycles",     &fLkPumpCycY,     true  },
+    { "sensor.lake_emporia_water_heater_today_kwh",            &fLkWaterKwhToday, false },
+    { "sensor.lake_emporia_water_heater_yesterday_kwh",        &fLkWaterKwhYest,  false },
+    { "sensor.lake_emporia_water_heater_today_runtime_min",    &fLkWaterMinT,     true  },
+    { "sensor.lake_emporia_water_heater_yesterday_runtime_min",&fLkWaterMinY,     true  },
+    { "sensor.lake_emporia_water_heater_today_cycles",         &fLkWaterCycT,     true  },
+    { "sensor.lake_emporia_water_heater_yesterday_cycles",     &fLkWaterCycY,     true  },
+    { "sensor.lake_emporia_mains_today_kwh",          &fLkMainsKwhToday, false },
+    { "sensor.lake_emporia_mains_yesterday_kwh",      &fLkMainsKwhYest,  false },
+    { "sensor.lake_emporia_mains_today_dollars",      &fLkMainsDolToday, false },
+    { "sensor.lake_emporia_mains_yesterday_dollars",  &fLkMainsDolYest,  false },
+  };
+  int okCount = 0;
+  for (int i = 0; i < 22; i++) {
+    HTTPClient http;
+    char url[160];
+    snprintf(url, sizeof(url), "https://" HA_HOST "/api/states/%s", ents[i].eid);
+    http.begin(client, url);
+    http.setConnectTimeout(6000);
+    http.setTimeout(6000);
+    http.addHeader("Authorization", "Bearer " HA_TOKEN);
+    yield();
+    int code = http.GET();
+    String body;
+    if (code == 200) body = http.getString();
+    http.end();
+    yield();
+    if (code != 200) continue;
+    int sIdx = body.indexOf("\"state\":\"");
+    if (sIdx < 0) continue;
+    sIdx += 9;
+    int eIdx = body.indexOf("\"", sIdx);
+    if (eIdx < 0) continue;
+    String stateStr = body.substring(sIdx, eIdx);
+    if (ents[i].isInt) {
+      *((int*)ents[i].dest) = stateStr.toInt();
+    } else {
+      *((float*)ents[i].dest) = stateStr.toFloat();
+    }
+    okCount++;
+  }
+  Serial.printf("[LkYest] fetched %d/22 entities\n", okCount);
+  return okCount > 0;
+}
+
 // ── HOME ASSISTANT PUSH ───────────────────────────────────────────────────
 static bool postOne(WiFiClientSecure& client, const char* entityId, const char* body) {
   HTTPClient http;
@@ -1460,8 +1618,8 @@ void postToHA() {
   snprintf(body, sizeof(body),
     "{\"state\":\"%.3f\",\"attributes\":{\"unit_of_measurement\":\"kWh\","
     "\"device_class\":\"energy\",\"state_class\":\"total_increasing\","
-    "\"friendly_name\":\"%s\"}}",
-    totalKWh, isLakeHouse ? "Lake GTH Energy" : "Pondo Furnace Blower Energy");
+    "\"friendly_name\":\"%s GTH Energy\"}}",
+    totalKWh, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // GTH power
@@ -1469,8 +1627,8 @@ void postToHA() {
   snprintf(body, sizeof(body),
     "{\"state\":\"%d\",\"attributes\":{\"unit_of_measurement\":\"W\","
     "\"device_class\":\"power\",\"state_class\":\"measurement\","
-    "\"friendly_name\":\"%s\"}}",
-    myData.furnaceWatts, isLakeHouse ? "Lake GTH Power" : "Pondo Furnace Blower Power");
+    "\"friendly_name\":\"%s GTH Power\"}}",
+    myData.furnaceWatts, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // PUMP kWh
@@ -1478,8 +1636,8 @@ void postToHA() {
   snprintf(body, sizeof(body),
     "{\"state\":\"%.3f\",\"attributes\":{\"unit_of_measurement\":\"kWh\","
     "\"device_class\":\"energy\",\"state_class\":\"total_increasing\","
-    "\"friendly_name\":\"%s\"}}",
-    acKWh, isLakeHouse ? "Lake Pump Energy" : "Pondo AC Condenser Energy");
+    "\"friendly_name\":\"%s Pump Energy\"}}",
+    acKWh, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // PUMP power
@@ -1487,8 +1645,8 @@ void postToHA() {
   snprintf(body, sizeof(body),
     "{\"state\":\"%d\",\"attributes\":{\"unit_of_measurement\":\"W\","
     "\"device_class\":\"power\",\"state_class\":\"measurement\","
-    "\"friendly_name\":\"%s\"}}",
-    acWatts, isLakeHouse ? "Lake Pump Power" : "Pondo AC Condenser Power");
+    "\"friendly_name\":\"%s Pump Power\"}}",
+    acWatts, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // WTR kWh — Lake only
@@ -1522,8 +1680,8 @@ void postToHA() {
   // Status string
   snprintf(eid,  sizeof(eid),  "sensor.%s_status", pfx);
   snprintf(body, sizeof(body),
-    "{\"state\":\"%s\",\"attributes\":{\"friendly_name\":\"%s\"}}",
-    myData.status, isLakeHouse ? "Lake HVAC Status" : "Pondo HVAC Status");
+    "{\"state\":\"%s\",\"attributes\":{\"friendly_name\":\"%s HVAC Status\"}}",
+    myData.status, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // GTH cycle count
@@ -1531,8 +1689,8 @@ void postToHA() {
   snprintf(body, sizeof(body),
     "{\"state\":\"%d\",\"attributes\":{\"unit_of_measurement\":\"cycles\","
     "\"state_class\":\"total_increasing\","
-    "\"friendly_name\":\"%s\"}}",
-    rtcGthCycles, isLakeHouse ? "Lake GTH Cycles Today" : "Pondo Furnace Blower Cycles Today");
+    "\"friendly_name\":\"%s GTH Cycles Today\"}}",
+    rtcGthCycles, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // GTH runtime %  (%% in format string = literal % in output)
@@ -1540,8 +1698,8 @@ void postToHA() {
   snprintf(body, sizeof(body),
     "{\"state\":\"%.1f\",\"attributes\":{\"unit_of_measurement\":\"%%\","
     "\"state_class\":\"measurement\","
-    "\"friendly_name\":\"%s\"}}",
-    runtimePercent, isLakeHouse ? "Lake GTH Runtime %" : "Pondo Furnace Blower Runtime %");
+    "\"friendly_name\":\"%s GTH Runtime %%\"}}",
+    runtimePercent, locLabel);
   postOne(client, eid, body) ? ok++ : haFailCount++;
 
   // COP — Lake only
@@ -1574,6 +1732,7 @@ bool doWiFiSession(bool needNTP, bool needWeather) {
   startupWifiFailCount = 0;
   // v51: fetch current kWh rate from Pi5 (via HA sensor.kwh_rate_now) once per WiFi session
   fetchCurrentRate();
+  fetchLakeYesterdayMainsData();  // v62 Lake
   bool ntpOK = true;
   if (needNTP) {
     ntpOK = syncNTPTime();
@@ -1587,21 +1746,19 @@ bool doWiFiSession(bool needNTP, bool needWeather) {
   time_t now_t = time(NULL);
   if (timeValid && now_t >= nextHAPost) {
     postToHA();
-    // v63 fix: only schedule next POST if this one actually ran (systemReady).
-    // Otherwise a Skipped post would lock out the next 30 min of HA updates after boot.
-    if (systemReady) nextHAPost = now_t + HA_POST_INTERVAL_SEC;
+    nextHAPost = now_t + HA_POST_INTERVAL_SEC;
   }
   disconnectWiFi(); Serial.println("[WiFi] Session done"); return ntpOK;
 }
 
 bool initESPNow() {
   WiFi.mode(WIFI_STA); yieldDelay(100);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(activeChannel, WIFI_SECOND_CHAN_NONE);
   Serial.println("[ESP-NOW] Ch1"); yieldDelay(50);
   if (esp_now_init() != ESP_OK) { Serial.println("[ESP-NOW] Init fail"); return false; }
   yieldDelay(100); esp_now_register_send_cb(onDataSent);
   esp_now_peer_info_t peer = {};
-  peer.channel = 1; peer.encrypt = false; peer.ifidx = WIFI_IF_STA;
+  peer.channel = activeChannel; peer.encrypt = false; peer.ifidx = WIFI_IF_STA;
   memcpy(peer.peer_addr, elkMAC, 6);
   if (esp_now_add_peer(&peer) != ESP_OK) { Serial.println("[ESP-NOW] Peer fail"); return false; }
   Serial.printf("[ESP-NOW] ELK: %02X:%02X:%02X:%02X:%02X:%02X\n",
@@ -1667,6 +1824,7 @@ void checkSystemErrors() {
 void updateDisplay(float current, int power, float outdoorTemp,
                    float kWh, int state, bool wifiActive) {
   yield(); u8g2.clearBuffer(); u8g2.setFont(u8g2_font_6x12_mf);
+  Serial.println("[OLED] -- frame --");
   char buf[22];
   float rate = fetchedKwhRate;  // v51: from Pi5 via HA sensor.kwh_rate_now
 
@@ -1678,52 +1836,86 @@ void updateDisplay(float current, int power, float outdoorTemp,
     char ts[6]; strftime(ts, sizeof(ts), "%H:%M", &timeinfo); u8g2.print(ts);
   } else u8g2.print("--:--");
   u8g2.setCursor(75, 11); u8g2.print(" "); u8g2.print(SKETCH_NAME + 4);
+  {
+    char l1[22];
+    if (timeValid) {
+      char ts2[6]; struct tm tt; if (getLocalTime(&tt, 50)) strftime(ts2, sizeof(ts2), "%H:%M", &tt); else strcpy(ts2, "--:--");
+      snprintf(l1, sizeof(l1), "Out %dF %s %s", (int)outdoorTemp, ts2, SKETCH_NAME + 4);
+    } else {
+      snprintf(l1, sizeof(l1), "Out %dF --:-- %s", (int)outdoorTemp, SKETCH_NAME + 4);
+    }
+    Serial.print("[OLED L1] "); Serial.println(l1);
+  }
 
   // Line 2 (y=22): static circuit identity label, tight format to fit cycle digits.
   //   Pondo CT0/1 = furnace blower+gas -> "FAN"
   //   Lake  CT0/1 = WPV36 geo compressor -> "GTH"
   //   State info lives in myData.status / HA sensor.
   u8g2.setCursor(2, 22);
-  const char* line2_label = isLakeHouse ? "GTH" : "FURN";
-  snprintf(buf, sizeof(buf), "%s:%4d %2dh %2d%%C:%d",
-    line2_label, power, (int)runtimeHoursToday, (int)runtimePercent, rtcGthCycles);
-  buf[21] = 0; u8g2.print(buf);
+  if (isLakeHouse && myExtFilled) {
+    // v57: pull from Emporia (Frame B) since local CT is disconnected at Lake.
+    float gdlr = myExt.geo_today_cents / 100.0f;
+    snprintf(buf, sizeof(buf), "GTH: %3dm C:%d $%.2f",
+      (int)myExt.geo_runtime_min, (int)myExt.geo_cycles, gdlr);
+  } else {
+    const char* line2_label = isLakeHouse ? "GTH" : "FAN";
+    snprintf(buf, sizeof(buf), "%s:%4d %2dh %2d%%C:%d",
+      line2_label, power, (int)runtimeHoursToday, (int)runtimePercent, rtcGthCycles);
+  }
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
   // Line 3 (y=33): static circuit identity label.
   //   Pondo CT2/3 = AC condenser -> "AC "
   //   Lake  CT2/3 = Grundfos well pump -> "PMP"
   u8g2.setCursor(2, 33);
-  const char* line3_label = isLakeHouse ? "PMP" : "AC ";
-  snprintf(buf, sizeof(buf), "%s:%4d %2dh %2d%%C:%d",
-    line3_label, acWatts, (int)acRuntimeHoursToday, (int)acRuntimePercent, rtcPumpCycles);
-  buf[21] = 0; u8g2.print(buf);
+  if (isLakeHouse && myExtFilled) {
+    // Combined pump $ = pump_geo + pump_wtr; runtime/cycles = full pump activity.
+    float pdlr = (myExt.pump_geo_today_cents + myExt.pump_wtr_today_cents) / 100.0f;
+    snprintf(buf, sizeof(buf), "PMP: %3dm C:%d $%.2f",
+      (int)myExt.pump_runtime_min, (int)myExt.pump_cycles, pdlr);
+  } else {
+    const char* line3_label = isLakeHouse ? "PMP" : "AC ";
+    snprintf(buf, sizeof(buf), "%s:%4d %2dh %2d%%C:%d",
+      line3_label, acWatts, (int)acRuntimeHoursToday, (int)acRuntimePercent, rtcPumpCycles);
+  }
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
-  // Line 4 (y=44): WTR at Lake (water heater est), blank at Pondo
+  // Line 4 (y=44): WTR at Lake = water heater (Emporia devices[0]). Blank at Pondo.
   u8g2.setCursor(2, 44);
-  if (isLakeHouse) {
+  if (isLakeHouse && myExtFilled) {
+    float wdlr = myExt.devices[0].today_cents / 100.0f;
+    snprintf(buf, sizeof(buf), "WTR: %3dm C:%d $%.2f",
+      (int)myExt.devices[0].runtime_min, (int)myExt.devices[0].cycles, wdlr);
+    buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
+  } else if (isLakeHouse) {
     snprintf(buf, sizeof(buf), "WTR:%4d %2dh %2d%%C:%d",
       wtrWatts, (int)wtrRuntimeHoursToday, (int)wtrRuntimePercent, rtcWtrCycles);
-    buf[21] = 0; u8g2.print(buf);
+    buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
   } else {
     u8g2.print("                     ");
   }
 
-  // Line 5 (y=55): G:$3.70 P:$1.13 W:$0.06  (Lake) or FAN:$x.xx  AC:$x.xx  (Pondo)
+  // Line 5 (y=55): cost summary. Lake = Emporia G/P/W; Pondo = FAN/AC firmware-local.
   u8g2.setCursor(2, 55);
-  if (isLakeHouse) {
+  if (isLakeHouse && myExtFilled) {
+    float gd = myExt.geo_today_cents / 100.0f;
+    float pd = (myExt.pump_geo_today_cents + myExt.pump_wtr_today_cents) / 100.0f;
+    float wd = myExt.devices[0].today_cents / 100.0f;
+    snprintf(buf, sizeof(buf), "G$%.2f P$%.2f W$%.2f", gd, pd, wd);
+  } else if (isLakeHouse) {
     snprintf(buf, sizeof(buf), "G:$%.2f P:$%.2f W:$%.2f",
       kWh * rate, acKWh * rate, wtrKWh * rate);
   } else {
     snprintf(buf, sizeof(buf), "FAN:$%.2f  AC:$%.2f",
       kWh * rate, acKWh * rate);
   }
-  buf[21] = 0; u8g2.print(buf);
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
   // Line 6 (y=66): WX+27-0 NT+1-0
   u8g2.setCursor(2, 66);
   snprintf(buf, sizeof(buf), "WX+%d-%d NT+%d-%d",
     weatherFetchCount, weatherFailCount, ntpSyncCount, ntpFailCount);
-  buf[21] = 0; u8g2.print(buf);
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
   // Line 7 (y=77): WF+28-0 EN-57 WD:0  (ELK%/heap appended only if problem)
   u8g2.setCursor(2, 77);
@@ -1736,13 +1928,18 @@ void updateDisplay(float current, int power, float outdoorTemp,
     snprintf(buf, sizeof(buf), "WF+%d-%d EN-%d WD:%d",
       wifiSuccessCount, wifiFailCount, espnowFailTotal, wdtResetCount);
   }
-  buf[21] = 0; u8g2.print(buf);
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
-  // Line 8 (y=88): Total: $4.89
+  // Line 8 (y=88): Total today $. Lake = mains from Emporia, Pondo = sum of CTs.
   u8g2.setCursor(2, 88);
-  float totalCost = (kWh + acKWh + wtrKWh) * rate;
+  float totalCost;
+  if (isLakeHouse && myExtFilled) {
+    totalCost = myExt.mains_today_cents / 100.0f;
+  } else {
+    totalCost = (kWh + acKWh + wtrKWh) * rate;
+  }
   snprintf(buf, sizeof(buf), "Total: $%.2f", totalCost);
-  buf[21] = 0; u8g2.print(buf);
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
   // Line 9 (y=99): error msg OR last restart time if no error
   u8g2.setCursor(2, 99);
@@ -1751,7 +1948,7 @@ void updateDisplay(float current, int power, float outdoorTemp,
   } else {
     snprintf(buf, sizeof(buf), "%-21s", lastRestartTime);
   }
-  buf[21] = 0; u8g2.print(buf);
+  buf[21] = 0; u8g2.print(buf); Serial.print("[OLED] "); Serial.println(buf);
 
   // Lines 10-11: blank
   u8g2.setCursor(2, 110); u8g2.print("                     ");
@@ -1845,7 +2042,6 @@ void setup() {
 
   // ── Phase 2: Weather (non-blocking — loop retries if this fails) ──────
   if (timeValid) {
-    systemReady = true;  // v63 fix: enable HA POST in this WiFi session so first POST after every boot fires
     Serial.println("[STARTUP] NTP done — fetching weather on fresh connection...");
     yieldDelay(500);
     doWiFiSession(false, true);
@@ -1898,6 +2094,7 @@ void setup() {
 // LOOP
 // ================================================================
 void loop() {
+  readSerialEXT();
   unsigned long now = millis();
 
   if (lastStateTime > 0) {
@@ -2074,7 +2271,32 @@ void loop() {
   myData.gthCycleCount       = rtcGthCycles;   // NEW v36
   myData.pumpCycleCount      = rtcPumpCycles;  // NEW v36
   myData.wtrCycleCount       = rtcWtrCycles;   // NEW v36
-  myData.kwhRate             = fetchedKwhRate; // NEW v51 - push rate to ELK
+  myData.kwhRate             = fetchedKwhRate;
+  // v62 Lake: populate Today/Yest fields for ELK display
+  if (isLakeHouse) {
+    myData.lakeGeoKwhToday = fLkGeoKwhToday;
+    myData.lakeGeoKwhYest = fLkGeoKwhYest;
+    myData.lakeGeoMinutesToday = fLkGeoMinT;
+    myData.lakeGeoMinutesYest = fLkGeoMinY;
+    myData.lakeGeoCyclesToday = fLkGeoCycT;
+    myData.lakeGeoCyclesYest = fLkGeoCycY;
+    myData.lakePumpKwhToday = fLkPumpKwhToday;
+    myData.lakePumpKwhYest = fLkPumpKwhYest;
+    myData.lakePumpMinutesToday = fLkPumpMinT;
+    myData.lakePumpMinutesYest = fLkPumpMinY;
+    myData.lakePumpCyclesToday = fLkPumpCycT;
+    myData.lakePumpCyclesYest = fLkPumpCycY;
+    myData.lakeWaterKwhToday = fLkWaterKwhToday;
+    myData.lakeWaterKwhYest = fLkWaterKwhYest;
+    myData.lakeWaterMinutesToday = fLkWaterMinT;
+    myData.lakeWaterMinutesYest = fLkWaterMinY;
+    myData.lakeWaterCyclesToday = fLkWaterCycT;
+    myData.lakeWaterCyclesYest = fLkWaterCycY;
+    myData.lakeMainsKwhToday = fLkMainsKwhToday;
+    myData.lakeMainsKwhYest = fLkMainsKwhYest;
+    myData.lakeMainsDollarsToday = fLkMainsDolToday;
+    myData.lakeMainsDollarsYest = fLkMainsDolYest;
+  } // NEW v51 - push rate to ELK
 
   const char* geoLabel;
   if (isLakeHouse) {
@@ -2103,12 +2325,18 @@ void loop() {
   myData.packetNum = elkPacketsSent;
   elkPacketsSent++; lastSendOK = false;
   esp_err_t r = esp_now_send(elkMAC, (uint8_t*)&myData, sizeof(myData));
+  yieldDelay(20);
+  sendFrameB();
   yield(); yieldDelay(50);
   if (r == ESP_OK && lastSendOK) {
     elkPacketsSuccess++; espnowFailCount = 0; espnowOK = true;
   } else {
     failCount++; espnowFailCount++; espnowFailTotal++;
     if (espnowFailCount >= 5) { espnowOK = false; Serial.println("[ERROR] ESP-NOW!"); }
+    if (espnowFailCount >= 30) {
+      Serial.printf("[v61] %d consecutive ESP-NOW fails -- restarting to re-detect channel\n", espnowFailCount);
+      delay(500); ESP.restart();
+    }
   }
   packetCount++;
 
@@ -2142,4 +2370,95 @@ bool createLogFile() { return false; }
 // ================================================================
 // End of sketch
 // ================================================================
+
+
+// =================================================================
+// FRAME B -- helpers (added v55)
+// =================================================================
+static char extLineBuf[512];
+static size_t extLineLen = 0;
+
+static uint16_t pop_u16(char** sp) {
+  char* tok = strtok_r(NULL, " \t\r\n", sp);
+  return tok ? (uint16_t) atoi(tok) : 0;
+}
+static uint8_t pop_u8(char** sp) {
+  char* tok = strtok_r(NULL, " \t\r\n", sp);
+  return tok ? (uint8_t) atoi(tok) : 0;
+}
+static float pop_f(char** sp) {
+  char* tok = strtok_r(NULL, " \t\r\n", sp);
+  return tok ? (float) atof(tok) : 0.0f;
+}
+
+static void applyExtLine(char* line) {
+  // Format documented in HVACv55: positional, single line, ends at newline.
+  // First token must be "EXT", second must be version "1".
+  char* save = NULL;
+  char* tok = strtok_r(line, " \t\r\n", &save);
+  if (!tok || strcmp(tok, "EXT") != 0) return;
+  tok = strtok_r(NULL, " \t\r\n", &save);
+  if (!tok || atoi(tok) != 1) return;
+
+  hvac_lake_extension n = {};
+  n.magic   = 0xE36B;
+  n.version = 1;
+  n.geo_today_cents       = pop_u16(&save);
+  n.geo_yesterday_cents   = pop_u16(&save);
+  n.pump_geo_today_cents  = pop_u16(&save);
+  n.pump_geo_yesterday_cents = pop_u16(&save);
+  n.pump_wtr_today_cents  = pop_u16(&save);
+  n.pump_wtr_yesterday_cents = pop_u16(&save);
+  n.geo_runtime_min  = pop_u16(&save);
+  n.geo_cycles       = pop_u8(&save);
+  n.pump_runtime_min = pop_u16(&save);
+  n.pump_cycles      = pop_u8(&save);
+  for (int i = 0; i < 6; i++) {
+    n.devices[i].today_cents     = pop_u16(&save);
+    n.devices[i].yesterday_cents = pop_u16(&save);
+    n.devices[i].runtime_min     = pop_u16(&save);
+    n.devices[i].cycles          = pop_u8(&save);
+    n.devices[i].flag            = pop_u8(&save);
+  }
+  n.mains_today_cents     = pop_u16(&save);
+  n.mains_yesterday_cents = pop_u16(&save);
+  n.mains_kwh_today       = pop_f(&save);
+  n.misc_today_cents      = pop_u16(&save);
+  n.misc_yesterday_cents  = pop_u16(&save);
+  n.source_water_f        = pop_f(&save);
+  n.cop_today             = pop_f(&save);
+  // Remaining text (if any) is first_error string -- single token, no spaces.
+  char* rest = strtok_r(NULL, "\r\n", &save);
+  if (rest && strcmp(rest, "-") != 0) {
+    strncpy(n.first_error, rest, sizeof(n.first_error) - 1);
+    n.first_error[sizeof(n.first_error) - 1] = '\0';
+  } else {
+    n.first_error[0] = '\0';
+  }
+  memcpy(&myExt, &n, sizeof(myExt));
+  myExtFilled = true;
+  lastExtUpdateMs = millis();
+  Serial.println("[EXT] applied Frame B from serial");
+}
+
+static void readSerialEXT() {
+  while (Serial.available() > 0) {
+    int c = Serial.read();
+    if (c < 0) break;
+    if (c == '\n' || extLineLen >= sizeof(extLineBuf) - 1) {
+      extLineBuf[extLineLen] = 0;
+      if (extLineLen > 4) applyExtLine(extLineBuf);
+      extLineLen = 0;
+    } else if (c != '\r') {
+      extLineBuf[extLineLen++] = (char) c;
+    }
+  }
+}
+
+static void sendFrameB() {
+  if (!isLakeHouse) return;
+  if (!myExtFilled)  return;
+  esp_err_t r = esp_now_send(elkMAC, (uint8_t*)&myExt, sizeof(myExt));
+  if (r != ESP_OK) Serial.printf("[FrameB] send fail %d\n", (int)r);
+}
 ```
